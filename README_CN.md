@@ -80,7 +80,7 @@ score = coherence × sim^0.5
 - Milvus（向量数据库）
 - QwenEmbedding（vLLM，端口 8002）
 - QwenReranker（vLLM，端口 8001）
-- DeepSeek API 密钥
+- LLM API 密钥（兼容 OpenAI 接口：DeepSeek / Qwen / GPT 等）
 
 ### 安装配置
 

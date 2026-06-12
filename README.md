@@ -78,7 +78,7 @@ where `sim` = Reranker semantic similarity (> 0.4 threshold, min 0.01).
 - Milvus (vector database)
 - QwenEmbedding (vLLM on port 8002)
 - QwenReranker (vLLM on port 8001)
-- DeepSeek API key
+- LLM API key (OpenAI-compatible: DeepSeek / Qwen / GPT / etc.)
 
 ### Setup
 
