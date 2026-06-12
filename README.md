@@ -42,12 +42,12 @@ FIGO 2023 Stage + Reasoning          MoE Dynamic Fusion (ARF Gate)
 
 ```
 Raw Patient Records (Word/PDF)
-    │  data/extract_patients.py: DeepSeek API extracts structured features
+    │  data/extract_patients.py: LLM API extracts structured features
     ▼
 clinical_dataset_v3.jsonl
     │  data/build_training_data.py: 3-stage neuro-symbolic refinement
     │    (i)  Keyword pre-filter
-    │    (ii) LLM Judge QC (DeepSeek, temperature=0.0)
+    │    (ii) LLM Judge QC (temperature=0.0)
     │    (iii) Graph score threshold (pos_graph ≥ 0.1)
     ▼
 moe_training_data_v2_subgraph.json  (ARF Gate + CAES training data)
@@ -76,8 +76,8 @@ where `sim` = Reranker semantic similarity (> 0.4 threshold, min 0.01).
 - Python 3.10+
 - Neo4j (graph database)
 - Milvus (vector database)
-- QwenEmbedding (vLLM on port 8002)
-- QwenReranker (vLLM on port 8001)
+- Embedding service (OpenAI-compatible API; e.g., QwenEmbedding via vLLM)
+- Reranker service (OpenAI-compatible API; e.g., QwenReranker via vLLM)
 - LLM API key (OpenAI-compatible: DeepSeek / Qwen / GPT / etc.)
 
 ### Setup

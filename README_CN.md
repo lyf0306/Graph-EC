@@ -42,12 +42,12 @@ FIGO 2023 分期 + 推理链              MoE 动态融合（ARF 门控）
 
 ```
 原始患者病历（Word/PDF）
-    │  data/extract_patients.py：DeepSeek API 提取结构化特征
+    │  data/extract_patients.py：LLM API 提取结构化特征
     ▼
 clinical_dataset_v3.jsonl
     │  data/build_training_data.py：三阶段神经符号精炼
     │    (i)  关键词预筛选
-    │    (ii) LLM 评委质控（DeepSeek，temperature=0.0）
+    │    (ii) LLM 评委质控（temperature=0.0）
     │    (iii) 图评分阈值（pos_graph ≥ 0.1）
     ▼
 moe_training_data_v2_subgraph.json（ARF 门控 + CAES 训练数据）
@@ -78,8 +78,8 @@ score = coherence × sim^0.5
 - Python 3.10+
 - Neo4j（图数据库）
 - Milvus（向量数据库）
-- QwenEmbedding（vLLM，端口 8002）
-- QwenReranker（vLLM，端口 8001）
+- Embedding 服务（兼容 OpenAI 接口，如 QwenEmbedding + vLLM）
+- Reranker 服务（兼容 OpenAI 接口，如 QwenReranker + vLLM）
 - LLM API 密钥（兼容 OpenAI 接口：DeepSeek / Qwen / GPT 等）
 
 ### 安装配置

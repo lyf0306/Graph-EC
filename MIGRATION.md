@@ -53,7 +53,7 @@ These are database-level identifiers in Oracle and must remain as-is:
 - `neo4j` (AsyncGraphDatabase)
 - `pymilvus` (Milvus vector DB)
 - `sentence-transformers` (embedding + reranker)
-- `openai` (AsyncOpenAI — DeepSeek API compatible)
+- `openai` (AsyncOpenAI — OpenAI-compatible API)
 - `torch` (MoE router + CAES attention)
 
 ### API Layer
@@ -78,12 +78,12 @@ Copy `.env.example` to `.env` and configure:
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `LLM_API_KEY` | DeepSeek API key | — |
-| `LLM_BASE_URL` | LLM API endpoint | `https://api.deepseek.com` |
-| `LLM_MODEL_NAME` | Model name | `deepseek-chat` |
-| `EMBEDDING_API_URL` | QwenEmbedding endpoint | `http://localhost:8002/v1` |
+| `LLM_API_KEY` | LLM API key (OpenAI-compatible) | — |
+| `LLM_BASE_URL` | LLM API endpoint | `https://api.deepseek.com` (example) |
+| `LLM_MODEL_NAME` | Model name | `deepseek-chat` (example) |
+| `EMBEDDING_API_URL` | Embedding service endpoint | `http://localhost:8002/v1` (example) |
 | `EMBEDDING_DIM` | Embedding dimension | `2560` |
-| `RERANK_API_URL` | QwenReranker endpoint | `http://localhost:8001/v1` |
+| `RERANK_API_URL` | Reranker service endpoint | `http://localhost:8001/v1` (example) |
 | `NEO4J_URI` | Neo4j graph DB URI | `neo4j://localhost:7688` |
 | `MILVUS_URI` | Milvus vector DB URI | `http://localhost:19530` |
 | `MOE_MODEL_PATH` | MoE router checkpoint | `/root/Model/moe_router.pth` |
@@ -95,8 +95,8 @@ Copy `.env.example` to `.env` and configure:
 
 | Service | Port | Purpose |
 |---------|------|---------|
-| QwenEmbedding (vLLM) | 8002 | 2560-dim dense embeddings |
-| QwenReranker (vLLM) | 8001 | Cross-encoder reranking |
+| Embedding (e.g., QwenEmbedding + vLLM) | 8002 | Dense embeddings |
+| Reranker (e.g., QwenReranker + vLLM) | 8001 | Cross-encoder reranking |
 | Neo4j | 7688 | Clinical knowledge graph storage |
 | Milvus | 19530 | Vector similarity search |
 | PathoRAG API | 8000 | REST API server |
