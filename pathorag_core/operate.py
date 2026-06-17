@@ -71,6 +71,258 @@ def chunking_by_token_size(
     return results
 
 
+def chunking_by_markdown_headers(
+    content: str,
+    overlap_token_size=128,
+    max_token_size=1024,
+    tiktoken_model="gpt-4o",
+    heading_level=2,
+    min_section_tokens=0,
+    fallback_ratio=0.8,
+):
+    """Semantically chunk markdown content by headings (#, ##, ###, etc.).
+
+    Each heading + its body content forms a logical section. Sections larger than
+    ``max_token_size`` are further sub-chunked using token-based sliding windows
+    (with the section heading prepended for context).
+
+    **Fallback logic** (semantic-first, fixed-size as safety net):
+
+    1. If the document contains **no headings**, falls back immediately.
+    2. If semantic chunking produces only **1 section** (single heading for the
+       entire document), the structure is essentially flat → falls back.
+    3. If **> ``fallback_ratio`` fraction** of chunks are sub-chunks from oversized
+       sections, the heading structure is too coarse to help → falls back.
+
+    Parameters
+    ----------
+    content : str
+        The raw markdown text.
+    overlap_token_size : int
+        Token overlap for sub-chunking oversized sections.
+    max_token_size : int
+        Maximum tokens per chunk.
+    tiktoken_model : str
+        The tiktoken model name for tokenization.
+    heading_level : int
+        Maximum heading level to split on (1 = only ``#``, 2 = ``#`` + ``##``, etc.).
+        Headings deeper than this level are treated as regular text.
+    min_section_tokens : int
+        If a section has fewer than this many tokens, merge it with the *following*
+        section to avoid overly granular chunks. 0 disables merging.
+    fallback_ratio : float
+        If the fraction of sub-chunks (from oversized sections) exceeds this value,
+        fall back to fixed-size token chunking.  Set to 1.0 to disable this check.
+
+    Returns
+    -------
+    list[dict]
+        List of chunk dicts with keys ``tokens``, ``content``, ``chunk_order_index``,
+        and optionally ``heading_path`` (the breadcrumb heading trail).
+    """
+    if heading_level < 1 or heading_level > 6:
+        raise ValueError("heading_level must be between 1 and 6")
+
+    # Pattern: match ATX headings at the desired depth
+    heading_pattern = re.compile(
+        r"^(#{1," + str(heading_level) + r"})\s+(.+)$", re.MULTILINE
+    )
+
+    heading_matches = list(heading_pattern.finditer(content))
+
+    # ── No headings → fall back to fixed-size token chunking ──
+    if not heading_matches:
+        logger.info(
+            "No markdown headings found in content; falling back to fixed-size token chunking"
+        )
+        return chunking_by_token_size(
+            content,
+            overlap_token_size=overlap_token_size,
+            max_token_size=max_token_size,
+            tiktoken_model=tiktoken_model,
+        )
+
+    # ── Extract sections with their heading breadcrumb ──
+    # heading_stack tracks the current heading hierarchy, e.g.:
+    #   ["# Summary"] or ["# Methods", "## Statistical Analysis"]
+    raw_sections: list[dict] = []
+    heading_stack: list[str] = []
+
+    for i, match in enumerate(heading_matches):
+        level_hashes = match.group(1)  # e.g. "##"
+        heading_text = match.group(2).strip()
+        heading_depth = len(level_hashes)
+
+        # Determine section text boundaries
+        start_pos = match.start()
+        if i + 1 < len(heading_matches):
+            end_pos = heading_matches[i + 1].start()
+        else:
+            end_pos = len(content)
+
+        section_text = content[start_pos:end_pos].strip()
+
+        # Update heading stack to reflect current depth
+        # Pop deeper headings that are no longer in scope
+        while len(heading_stack) >= heading_depth:
+            heading_stack.pop()
+        heading_stack.append(f"{level_hashes} {heading_text}")
+
+        # Build the full heading path (e.g. "# Methods > ## Statistical Analysis")
+        heading_path = " > ".join(heading_stack)
+
+        raw_sections.append(
+            {
+                "heading_path": heading_path,
+                "heading_text": heading_text,
+                "section_text": section_text,
+                "depth": heading_depth,
+            }
+        )
+
+    # Capture preamble (content before the first heading) if present
+    if heading_matches and heading_matches[0].start() > 0:
+        preamble = content[: heading_matches[0].start()].strip()
+        if preamble:
+            raw_sections.insert(
+                0,
+                {
+                    "heading_path": "",
+                    "heading_text": "",
+                    "section_text": preamble,
+                    "depth": 0,
+                },
+            )
+
+    # ── Merge undersized adjacent sections ──
+    if min_section_tokens > 0:
+        merged_sections: list[dict] = []
+        pending: dict | None = None
+
+        for sec in raw_sections:
+            sec_tokens = len(
+                encode_string_by_tiktoken(sec["section_text"], model_name=tiktoken_model)
+            )
+            if pending is not None:
+                # Merge pending into current section
+                sec["section_text"] = (
+                    pending["section_text"] + "\n\n" + sec["section_text"]
+                )
+                # Prefer the higher-level heading as the heading_path
+                if pending["depth"] <= sec["depth"] and pending["heading_path"]:
+                    sec["heading_path"] = pending["heading_path"]
+                pending = None
+
+            if sec_tokens < min_section_tokens and sec is not raw_sections[-1]:
+                pending = sec
+            else:
+                merged_sections.append(sec)
+
+        if pending is not None:
+            merged_sections.append(pending)
+
+        raw_sections = merged_sections
+
+    # ── Build final chunks with overflow protection ──
+    results: list[dict] = []
+    chunk_index = 0
+
+    for sec in raw_sections:
+        section_text = sec["section_text"]
+        tokens = encode_string_by_tiktoken(section_text, model_name=tiktoken_model)
+        heading_path = sec["heading_path"]
+
+        if len(tokens) <= max_token_size:
+            # Section fits in one chunk
+            results.append(
+                {
+                    "tokens": len(tokens),
+                    "content": section_text,
+                    "chunk_order_index": chunk_index,
+                    "heading_path": heading_path,
+                }
+            )
+            chunk_index += 1
+        else:
+            # Section too large — sub-chunk with token-based sliding window,
+            # prepending the heading path to each sub-chunk for context.
+            heading_prefix = heading_path + "\n\n" if heading_path else ""
+            heading_tokens = len(
+                encode_string_by_tiktoken(heading_prefix, model_name=tiktoken_model)
+            )
+
+            # Adjust effective max so heading_prefix + body fits within max_token_size
+            effective_max = max_token_size - heading_tokens
+            if effective_max < 256:
+                # Heading is very long; fall back to plain token chunking
+                effective_max = max_token_size
+                heading_prefix = ""
+
+            for sub_idx, start in enumerate(
+                range(0, len(tokens), effective_max - overlap_token_size)
+            ):
+                sub_tokens = tokens[start : start + effective_max]
+                sub_content = decode_tokens_by_tiktoken(
+                    sub_tokens, model_name=tiktoken_model
+                )
+                full_content = heading_prefix + sub_content.strip()
+                full_tokens_len = min(
+                    max_token_size,
+                    len(tokens) - start + (heading_tokens if heading_prefix else 0),
+                )
+                results.append(
+                    {
+                        "tokens": full_tokens_len,
+                        "content": full_content.strip(),
+                        "chunk_order_index": chunk_index,
+                        "heading_path": heading_path,
+                    }
+                )
+                chunk_index += 1
+
+    # ── Quality heuristic: fall back to fixed-size if semantic chunking
+    #     didn't produce a meaningfully better split ──
+    meaningful_sections = [s for s in raw_sections if s["depth"] > 0]  # exclude preamble
+    num_sections = len(meaningful_sections)
+
+    # Heuristic 1: Only 0-1 heading section → effectively unstructured
+    if num_sections <= 1 and fallback_ratio < 1.0:
+        logger.info(
+            f"Semantic chunking degraded: only {num_sections} heading section(s) found. "
+            f"Falling back to fixed-size token chunking."
+        )
+        return chunking_by_token_size(
+            content,
+            overlap_token_size=overlap_token_size,
+            max_token_size=max_token_size,
+            tiktoken_model=tiktoken_model,
+        )
+
+    # Heuristic 2: Too many oversized sections → heading structure is too coarse
+    if len(raw_sections) > 0 and fallback_ratio < 1.0:
+        oversized_count = sum(
+            1 for sec in raw_sections
+            if len(encode_string_by_tiktoken(sec["section_text"], model_name=tiktoken_model)) > max_token_size
+        )
+        if oversized_count / len(raw_sections) >= fallback_ratio:
+            logger.info(
+                f"Semantic chunking degraded: {oversized_count}/{len(raw_sections)} sections "
+                f"exceed max_token_size ({max_token_size}). Falling back to fixed-size chunking."
+            )
+            return chunking_by_token_size(
+                content,
+                overlap_token_size=overlap_token_size,
+                max_token_size=max_token_size,
+                tiktoken_model=tiktoken_model,
+            )
+
+    logger.info(
+        f"Semantic chunking: {len(raw_sections)} sections → {len(results)} chunks "
+        f"(max_tokens={max_token_size}, heading_level≤{heading_level})"
+    )
+    return results
+
+
 async def _handle_entity_relation_summary(
     entity_or_relation_name: str,
     description: str,

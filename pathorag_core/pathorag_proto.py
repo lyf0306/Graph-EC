@@ -12,6 +12,7 @@ from .llm import (
 )
 from .operate import (
     chunking_by_token_size,
+    chunking_by_markdown_headers,
     extract_entities,
     # local_query,global_query,hybrid_query,
     kg_query
@@ -126,9 +127,14 @@ class PathoRAG:
     log_level: str = field(default=current_log_level)
 
     # text chunking
+    chunking_mode: str = "semantic"  # "fixed" | "semantic"
     chunk_token_size: int = 1200
     chunk_overlap_token_size: int = 100
     tiktoken_model_name: str = "gpt-4o-mini"
+
+    # semantic chunking (only used when chunking_mode="semantic")
+    chunking_heading_level: int = 2  # max heading level to split on (1=#, 2=##, …)
+    chunking_min_section_tokens: int = 0  # merge sections smaller than this (0=disabled)
 
     # entity extraction
     entity_extract_max_gleaning: int = 2
@@ -288,20 +294,32 @@ class PathoRAG:
             update_storage = True
             logger.info(f"[New Docs] inserting {len(new_docs)} docs")
 
+            # ── Choose chunking strategy ──
+            if self.chunking_mode == "semantic":
+                _chunk_func = chunking_by_markdown_headers
+                _chunk_kwargs = dict(
+                    heading_level=self.chunking_heading_level,
+                    min_section_tokens=self.chunking_min_section_tokens,
+                )
+            else:
+                _chunk_func = chunking_by_token_size
+                _chunk_kwargs = {}
+
             inserting_chunks = {}
             for doc_key, doc in tqdm_async(
-                new_docs.items(), desc="Chunking documents", unit="doc"
+                new_docs.items(), desc=f"Chunking documents ({self.chunking_mode})", unit="doc"
             ):
                 chunks = {
                     compute_mdhash_id(dp["content"], prefix="chunk-"): {
                         **dp,
                         "full_doc_id": doc_key,
                     }
-                    for dp in chunking_by_token_size(
+                    for dp in _chunk_func(
                         doc["content"],
                         overlap_token_size=self.chunk_overlap_token_size,
                         max_token_size=self.chunk_token_size,
                         tiktoken_model=self.tiktoken_model_name,
+                        **_chunk_kwargs,
                     )
                 }
                 inserting_chunks.update(chunks)
