@@ -179,6 +179,25 @@ class NanoVectorDBStorage(BaseVectorStorage):
                 f"Error while deleting relations for entity {entity_name}: {e}"
             )
 
+    async def delete_by_hyperedge_name(self, hyperedge_name: str):
+        """Delete all entries whose ``hyperedge_name`` matches the given name."""
+        try:
+            entries = [
+                dp
+                for dp in self.client_storage["data"]
+                if dp.get("hyperedge_name") == hyperedge_name
+            ]
+            ids_to_delete = [entry["__id__"] for entry in entries]
+            if ids_to_delete:
+                self._client.delete(ids_to_delete)
+                logger.info(
+                    f"Hyperedge '{hyperedge_name}' deleted from {self.namespace} ({len(ids_to_delete)} entries)."
+                )
+        except Exception as e:
+            logger.error(
+                f"Error while deleting hyperedge '{hyperedge_name}': {e}"
+            )
+
     async def index_done_callback(self):
         self._client.save()
 
@@ -296,6 +315,13 @@ class NetworkXStorage(BaseGraphStorage):
             logger.info(f"Node {node_id} deleted from the graph.")
         else:
             logger.warning(f"Node {node_id} not found in the graph for deletion.")
+
+    async def delete_edge(self, source_node_id: str, target_node_id: str):
+        if self._graph.has_edge(source_node_id, target_node_id):
+            self._graph.remove_edge(source_node_id, target_node_id)
+            logger.info(f"Edge {source_node_id} → {target_node_id} deleted from the graph.")
+        else:
+            logger.warning(f"Edge {source_node_id} → {target_node_id} not found in the graph.")
 
     async def embed_nodes(self, algorithm: str) -> tuple[np.ndarray, list[str]]:
         if algorithm not in self._node_embed_algorithms:

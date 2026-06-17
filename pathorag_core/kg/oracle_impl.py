@@ -333,15 +333,29 @@ class OracleGraphStorage(BaseGraphStorage):
     #################### insert method ################
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]):
-        """插入或更新节点"""
-        # print("go into upsert node method")
-        entity_name = node_id
-        entity_type = node_data["entity_type"]
-        description = node_data["description"]
-        source_id = node_data["source_id"]
-        logger.debug(f"entity_name:{entity_name}, entity_type:{entity_type}")
+        """插入或更新节点（兼容实体节点与超边节点）。
 
-        content = entity_name + description
+        实体节点 ``node_data`` 包含:
+            ``entity_type``, ``description``, ``source_id``, ``role="entity"``
+
+        超边节点 ``node_data`` 包含:
+            ``weight``, ``source_id``, ``role="hyperedge"`` (无 entity_type/description)
+        """
+        node_name = node_id
+        source_id = node_data["source_id"]
+        role = node_data.get("role", "entity")
+
+        if role == "hyperedge":
+            # 超边：entity_type 存 "HYPEREDGE"，description 存 sequence 权重
+            entity_type = "HYPEREDGE"
+            description = str(node_data.get("weight", 1.0))
+        else:
+            entity_type = node_data.get("entity_type", "UNKNOWN")
+            description = node_data.get("description", "")
+
+        logger.debug(f"node_name:{node_name}, entity_type:{entity_type}, role:{role}")
+
+        content = node_name + description
         contents = [content]
         batches = [
             contents[i : i + self._max_batch_size]
@@ -355,7 +369,7 @@ class OracleGraphStorage(BaseGraphStorage):
         merge_sql = SQL_TEMPLATES["merge_node"]
         data = {
             "workspace": self.db.workspace,
-            "name": entity_name,
+            "name": node_name,
             "entity_type": entity_type,
             "description": description,
             "source_chunk_id": source_id,
@@ -364,7 +378,6 @@ class OracleGraphStorage(BaseGraphStorage):
         }
         # print(merge_sql)
         await self.db.execute(merge_sql, data)
-        # self._graph.add_node(node_id, **node_data)
 
     async def upsert_edge(
         self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
@@ -529,6 +542,24 @@ class OracleGraphStorage(BaseGraphStorage):
                 # print("Node Edge not exist!",self.db.workspace, source_node_id)
                 return []
 
+    async def delete_node(self, node_id: str):
+        """删除节点"""
+        SQL = SQL_TEMPLATES["delete_node"]
+        params = {"workspace": self.db.workspace, "name": node_id}
+        await self.db.execute(SQL, params)
+        logger.info(f"Node '{node_id}' deleted from Oracle Graph.")
+
+    async def delete_edge(self, source_node_id: str, target_node_id: str):
+        """删除边"""
+        SQL = SQL_TEMPLATES["delete_edge"]
+        params = {
+            "workspace": self.db.workspace,
+            "source_name": source_node_id,
+            "target_name": target_node_id,
+        }
+        await self.db.execute(SQL, params)
+        logger.info(f"Edge '{source_node_id}' → '{target_node_id}' deleted from Oracle Graph.")
+
     async def get_all_nodes(self, limit: int):
         """查询所有节点"""
         SQL = SQL_TEMPLATES["get_all_nodes"]
@@ -691,7 +722,11 @@ SQL_TEMPLATES = {
         WHERE a.workspace=:workspace and a.workspace=:workspace and b.workspace=:workspace
         AND a.name=:node_id or b.name = :node_id
         COLUMNS (a.name))""",
-    "get_node": """SELECT t1.name,t2.entity_type,t2.source_chunk_id as source_id,NVL(t2.description,'') AS description
+    "get_node": """SELECT t1.name,
+        CASE WHEN t2.entity_type = 'HYPEREDGE' THEN 'hyperedge' ELSE 'entity' END as role,
+        t2.entity_type,
+        t2.source_chunk_id as source_id,
+        NVL(t2.description,'') AS description
         FROM GRAPH_TABLE (graphr1_graph
         MATCH (a)
         WHERE a.workspace=:workspace AND a.name=:node_id
@@ -706,12 +741,19 @@ SQL_TEMPLATES = {
         AND a.name=:source_node_id and b.name = :target_node_id
         COLUMNS (e.id,a.name as source_id)
         ) t1 JOIN HYPERGRAPHRAG_GRAPH_EDGES t2 on t1.id=t2.id""",
-    "get_node_edges": """SELECT source_name,target_name
+    "get_node_edges": """SELECT source_name, target_name
             FROM GRAPH_TABLE (graphr1_graph
             MATCH (a)-[e]->(b)
             WHERE e.workspace=:workspace and a.workspace=:workspace and b.workspace=:workspace
-            AND a.name=:source_node_id
-            COLUMNS (a.name as source_name,b.name as target_name))""",
+            AND a.name = :source_node_id
+            COLUMNS (a.name as source_name, b.name as target_name))
+            UNION ALL
+            SELECT source_name, target_name
+            FROM GRAPH_TABLE (graphr1_graph
+            MATCH (a)-[e]->(b)
+            WHERE e.workspace=:workspace and a.workspace=:workspace and b.workspace=:workspace
+            AND b.name = :source_node_id
+            COLUMNS (a.name as source_name, b.name as target_name))""",
     "merge_node": """MERGE INTO HYPERGRAPHRAG_GRAPH_NODES a
                     USING DUAL
                     ON (a.workspace = :workspace and a.name=:name and a.source_chunk_id=:source_chunk_id)
@@ -724,6 +766,10 @@ SQL_TEMPLATES = {
                 WHEN NOT MATCHED THEN
                     INSERT(workspace,source_name,target_name,weight,keywords,description,source_chunk_id,content,content_vector)
                     values (:workspace,:source_name,:target_name,:weight,:keywords,:description,:source_chunk_id,:content,:content_vector) """,
+    "delete_node": """DELETE FROM HYPERGRAPHRAG_GRAPH_NODES
+                      WHERE workspace = :workspace AND name = :name""",
+    "delete_edge": """DELETE FROM HYPERGRAPHRAG_GRAPH_EDGES
+                      WHERE workspace = :workspace AND source_name = :source_name AND target_name = :target_name""",
     "get_all_nodes": """WITH t0 AS (
                         SELECT name AS id, entity_type AS label, entity_type, description,
                             '["' || replace(source_chunk_id, '<SEP>', '","') || '"]'     source_chunk_ids

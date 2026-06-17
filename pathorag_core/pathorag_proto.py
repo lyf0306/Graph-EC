@@ -562,3 +562,173 @@ class PathoRAG:
                 continue
             tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
         await asyncio.gather(*tasks)
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Hypergraph-aware cascading document deletion
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def delete_by_document(self, paper_name: str):
+        """Synchronous wrapper for :meth:`adelete_by_document`."""
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(self.adelete_by_document(paper_name))
+
+    async def adelete_by_document(self, paper_name: str):
+        """Delete a document and cascade-clean orphaned hypergraph structures.
+
+        Each hyperedge belongs to exactly one document, so all hyperedges
+        under *paper_name* are deleted together with it.  Entities, however,
+        may be shared across hyperedges from different documents — they are
+        only deleted when no surviving hyperedge references them.
+
+        Steps:
+
+        1. Find the document node.
+        2. Collect all hyperedges connected to this document.
+        3. For each hyperedge, collect the entity nodes it references.
+        4. Classify entities:
+           - **orphaned** (connected only to this documentʼs hyperedges) → delete.
+           - **shared** (has at least one neighbour outside the deleted set) → keep,
+             only remove the edge to the deleted hyperedge.
+        5. Remove all paper→hyperedge edges.
+        6. Delete orphaned entities (graph + vector DB).
+        7. Remove shared-entity → hyperedge edges.
+        8. Delete hyperedge nodes (graph + vector DB).
+        9. Delete the document node.
+
+        Parameters
+        ----------
+        paper_name : str
+            The paper / document identifier used during :meth:`ainsert`.
+        """
+        kg = self.chunk_entity_relation_graph
+
+        # ── Guard: document must exist ──────────────────────────────────
+        if not await kg.has_node(paper_name):
+            logger.warning(f"Document '{paper_name}' not found in graph; nothing to delete.")
+            return
+
+        # ── Phase 1: collect hyperedges directly under this document ────
+        doc_edges = await kg.get_node_edges(paper_name)
+        if not doc_edges:
+            logger.info(f"Document '{paper_name}' has no hyperedges; deleting node only.")
+            await kg.delete_node(paper_name)
+            await self._delete_by_document_done()
+            return
+
+        # doc_edges: [(paper_name, neighbor), …] for undirected graph → neighbor = hyperedge
+        doc_hyperedges: set[str] = set()
+        for edge in doc_edges:
+            neighbour = edge[1] if edge[0] == paper_name else edge[0]
+            doc_hyperedges.add(neighbour)
+
+        # ── Phase 2: for each hyperedge, collect entity neighbours ──────
+        hyperedge_to_entities: dict[str, set[str]] = {}
+        all_affected_entities: set[str] = set()
+
+        for he in doc_hyperedges:
+            he_edges = await kg.get_node_edges(he)
+            if not he_edges:
+                continue
+            entities: set[str] = set()
+            for edge in he_edges:
+                neighbour = edge[1] if edge[0] == he else edge[0]
+                if neighbour == paper_name:
+                    continue  # skip the document→hyperedge back-edge
+                node_data = await kg.get_node(neighbour)
+                if node_data and node_data.get("role") == "entity":
+                    entities.add(neighbour)
+            if entities:
+                hyperedge_to_entities[he] = entities
+                all_affected_entities.update(entities)
+
+        # ── Phase 3: classify entities ──────────────────────────────────
+        # orphaned  = connected ONLY to hyperedges inside *doc_hyperedges*
+        # shared    = has at least one neighbour outside the deleted set
+        entities_to_delete: set[str] = set()
+        entities_to_keep: set[str] = set()
+
+        for entity in all_affected_entities:
+            ent_edges = await kg.get_node_edges(entity)
+            if not ent_edges:
+                entities_to_delete.add(entity)
+                continue
+
+            surviving_neighbours: set[str] = set()
+            for edge in ent_edges:
+                neighbour = edge[1] if edge[0] == entity else edge[0]
+                if neighbour not in doc_hyperedges and neighbour != paper_name:
+                    surviving_neighbours.add(neighbour)
+
+            if surviving_neighbours:
+                entities_to_keep.add(entity)
+            else:
+                entities_to_delete.add(entity)
+
+        logger.info(
+            f"[Cascade] Document '{paper_name}': "
+            f"{len(doc_hyperedges)} hyperedges, "
+            f"{len(entities_to_delete)} entities to delete, "
+            f"{len(entities_to_keep)} entities to keep (shared)."
+        )
+
+        # ── Phase 4: remove paper→hyperedge edges ───────────────────────
+        for he in doc_hyperedges:
+            if await kg.has_edge(paper_name, he):
+                await kg.delete_edge(paper_name, he)
+
+        # ── Phase 5: delete orphaned entities (graph + vector DB) ───────
+        for entity in entities_to_delete:
+            logger.info(f"[Cascade] Deleting orphaned entity: {entity}")
+            try:
+                await self.entities_vdb.delete_entity(entity)
+            except Exception as e:
+                logger.error(f"[Cascade] Vector-DB entity deletion failed for '{entity}': {e}")
+            try:
+                await self.hyperedges_vdb.delete_relation(entity)
+            except Exception as e:
+                logger.error(f"[Cascade] Vector-DB relation cleanup failed for '{entity}': {e}")
+            try:
+                await kg.delete_node(entity)
+            except Exception as e:
+                logger.error(f"[Cascade] Graph node deletion failed for '{entity}': {e}")
+
+        # ── Phase 6: remove shared-entity → hyperedge edges (entity survives) ──
+        for entity in entities_to_keep:
+            for he in doc_hyperedges:
+                if await kg.has_edge(he, entity):
+                    logger.info(
+                        f"[Cascade] Removing edge '{he}' → '{entity}' "
+                        f"(entity shared across documents)."
+                    )
+                    await kg.delete_edge(he, entity)
+
+        # ── Phase 7: delete hyperedge nodes (graph + vector DB) ─────────
+        for he in doc_hyperedges:
+            logger.info(f"[Cascade] Deleting hyperedge: {he}")
+            try:
+                await self.hyperedges_vdb.delete_by_hyperedge_name(he)
+            except Exception as e:
+                logger.error(f"[Cascade] Vector-DB hyperedge deletion failed for '{he}': {e}")
+            try:
+                await kg.delete_node(he)
+            except Exception as e:
+                logger.error(f"[Cascade] Graph node deletion failed for '{he}': {e}")
+
+        # ── Phase 8: delete the document node itself ────────────────────
+        await kg.delete_node(paper_name)
+
+        logger.info(f"[Cascade] Document '{paper_name}' fully purged.")
+        await self._delete_by_document_done()
+
+    async def _delete_by_document_done(self):
+        """Persist storage after document deletion."""
+        tasks = []
+        for storage_inst in [
+            self.entities_vdb,
+            self.hyperedges_vdb,
+            self.chunk_entity_relation_graph,
+        ]:
+            if storage_inst is None:
+                continue
+            tasks.append(cast(StorageNameSpace, storage_inst).index_done_callback())
+        await asyncio.gather(*tasks)

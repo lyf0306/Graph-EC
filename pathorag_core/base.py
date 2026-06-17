@@ -127,5 +127,8 @@ class BaseGraphStorage(StorageNameSpace):
     async def delete_node(self, node_id: str):
         raise NotImplementedError
 
+    async def delete_edge(self, source_node_id: str, target_node_id: str):
+        raise NotImplementedError
+
     async def embed_nodes(self, algorithm: str) -> tuple[np.ndarray, list[str]]:
         raise NotImplementedError("Node embedding is not used in pathorag_core.")

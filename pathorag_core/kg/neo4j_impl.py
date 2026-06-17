@@ -361,6 +361,21 @@ class Neo4JStorage(BaseGraphStorage):
             inc_counter("neo4j_errors_total", labels={"operation": op_name})
             raise
 
+    async def delete_edge(self, source_node_id: str, target_node_id: str):
+        op_name = "delete_edge"
+        start = time.time()
+        inc_counter("neo4j_operations_total", labels={"operation": op_name})
+        try:
+            async with self.driver.session(database=self.database) as session:
+                query = (
+                    "MATCH (a {name: $src})-[r]->(b {name: $tgt}) DELETE r"
+                )
+                await session.run(query, src=source_node_id, tgt=target_node_id)
+            observe_histogram("neo4j_operation_duration_seconds", time.time() - start, labels={"operation": op_name})
+        except Exception:
+            inc_counter("neo4j_errors_total", labels={"operation": op_name}")
+            raise
+
     @retry(**READ_RETRY)
     async def get_paper_by_pmid(self, pmid: str)  -> Optional[str]:
         op_name = "get_paper_by_pmid"
