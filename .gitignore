@@ -50,6 +50,18 @@ CLUSTER_RAG_Endometrial/data/*.jsonl
 result/*.jsonl
 result/*.json
 !result/.gitkeep
+paper/comorbidity_analysis/
+batch_output/
+analysis_output/
+extracted_reports/
+tests/test_set.json
+tests/test_set_stats.json
+tests/empty_gt_samples.txt
+ablation_full_gen_standard.json
+batch_extract.py
+extract_tb_reports_v2.py
+test_extraction.py
+paper/prepare_llm_judge.py
 
 # Training data derived from patient records
 result/
