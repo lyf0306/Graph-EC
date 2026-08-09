@@ -8,6 +8,11 @@ GMM 版端到端患者相似性检索与多标签治疗方案预测系统（论�
 1. 聚类算法：KMeans(3) + softmax(-距离)  -->  GaussianMixture(covariance_type='full') + predict_proba 后验概率
 2. BIC 选参：K ∈ [K_MIN, K_MAX] 网格搜索，论文预期 K=4（BIC 最低）
 3. 新增统计验证模块（论文 5.3）：四簇画像表、ANOVA Top-10、卡方检验 + Cramér's V、BIC/PCA/t-SNE 图
+4. 新增稳健性检验（论文 5.3.5，--robust 开启）：
+   - K 敏感性（K=3,4,5）
+   - 聚类算法对比（GMM vs KMeans vs Ward，轮廓系数 + ARI，表 A.8）
+   - 特征扰动稳定性（随机剔除 20% 特征 × 100 次 → ARI 直方图，图 A.2）
+   - Bootstrap 稳定性（500 次有放回重采样 → 预测全量数据 → ARI 直方图，图 A.1）
 
 【生产接入点说明（后续任务，本脚本不修改生产文件）】
 - 生产检索器 PatientRetrieverV4._transform_patient 使用 kmeans.transform + softmax；
@@ -17,6 +22,7 @@ GMM 版端到端患者相似性检索与多标签治疗方案预测系统（论�
 数据流：
     raw JSON -> DataFrame -> 特征工程 -> [BIC 选 K] -> GMM 软聚类增强 -> [检索索引 + 分类模型]
     + 统计验证：四簇画像 / ANOVA / 卡方 / PCA-tSNE
+    + 稳健性（--robust）：K 敏感性 / 算法对比 ARI / 特征扰动 20%×100 ARI / Bootstrap 500 ARI
 
 用法：
     python v5_train_model_gmm.py --data <路径> [--mode train|validate|all] [--robust]
@@ -31,15 +37,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score,
+    adjusted_rand_score,
     classification_report,
     f1_score,
     hamming_loss,
     jaccard_score,
     roc_auc_score,
+    silhouette_score,
 )
 from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import StratifiedKFold
@@ -735,15 +744,19 @@ def _expanded_to_original_col(name: str) -> str:
     return body
 
 
-def get_soft_labels(preprocessor, df: pd.DataFrame, gmm) -> np.ndarray:
-    """对全量数据生成聚类硬标签（GMM predict，即后验概率 argmax）。"""
+def get_X_base(preprocessor, df: pd.DataFrame) -> np.ndarray:
+    """对全量数据应用与训练一致的临床加权 + 预处理，得到基础特征矩阵 X_base。"""
     feature_cols = [c for c in df.columns if c.startswith("X_")]
     X_raw = df[feature_cols].copy()
     for col in WEIGHT_COLS:
         if col in X_raw.columns:
             X_raw[col] = X_raw[col] * WEIGHT_MULTIPLIER
-    X_base = preprocessor.transform(X_raw)
-    return gmm.predict(X_base)
+    return preprocessor.transform(X_raw)
+
+
+def get_soft_labels(preprocessor, df: pd.DataFrame, gmm) -> np.ndarray:
+    """对全量数据生成聚类硬标签（GMM predict，即后验概率 argmax）。"""
+    return gmm.predict(get_X_base(preprocessor, df))
 
 
 def compute_comorbidity_score(df: pd.DataFrame) -> pd.Series:
@@ -960,20 +973,185 @@ def plot_projection(preprocessor, df: pd.DataFrame, labels: np.ndarray, out_dir:
     print(f"  已保存 -> {path}")
 
 
-# ======================== 稳健性检验（论文 5.3.1） ========================
+# ======================== 稳健性检验（论文 5.3.5） ========================
 
-def run_robustness_checks(df: pd.DataFrame, X: pd.DataFrame, y: pd.DataFrame, label_names: list[str],
-                          n_components: int, out_dir: Path):
+def _plot_ari_histogram(aris: list[float], title: str, path: Path) -> None:
+    """绘制 ARI 分布直方图（论文图 A.1 / A.2）。"""
+    plt.figure(figsize=(8, 5))
+    plt.hist(aris, bins=30, color="#1f77b4", alpha=0.8, edgecolor="white")
+    plt.axvline(np.mean(aris), color="red", linestyle="--",
+                label=f"均值 = {np.mean(aris):.3f}")
+    plt.xlabel("ARI")
+    plt.ylabel("次数")
+    plt.title(title)
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  已保存 -> {path}")
+
+
+def compare_clustering_algorithms(
+    X_base: np.ndarray,
+    baseline_labels: np.ndarray,
+    n_components: int,
+    out_dir: Path,
+) -> pd.DataFrame:
     """
-    P1 稳健性：
-      1. K 敏感性：K∈{3,4,5} 各跑一次 5 折 CV，对比 Macro F1 / AUC
-      2. Bootstrap 重采样：全量 GMM 簇占比的均值与 95% 区间
+    稳健性(2)：聚类算法对比（论文表 A.8，K=n_components）。
+    在相同特征空间 X_base 下分别运行 GMM / KMeans / Ward 层次聚类，
+    计算各方法的轮廓系数，以及与基准 GMM 标签的调整兰德指数 ARI。
+    """
+    print(f"\n--- 聚类算法对比（GMM vs KMeans vs Ward，K={n_components}） ---")
+
+    # GMM 即基准（管线中全特征 GMM），与自身 ARI = 1.0
+    gmm_labels = baseline_labels
+    sil_gmm = silhouette_score(X_base, gmm_labels)
+
+    kmeans = KMeans(n_clusters=n_components, random_state=RANDOM_STATE, n_init=10)
+    km_labels = kmeans.fit_predict(X_base)
+    sil_km = silhouette_score(X_base, km_labels)
+    ari_km = adjusted_rand_score(baseline_labels, km_labels)
+
+    ward = AgglomerativeClustering(n_clusters=n_components, linkage="ward")
+    ward_labels = ward.fit_predict(X_base)
+    sil_ward = silhouette_score(X_base, ward_labels)
+    ari_ward = adjusted_rand_score(baseline_labels, ward_labels)
+
+    rows = [
+        {"方法": "GMM",           "轮廓系数": round(sil_gmm, 4),  "与GMM的ARI": 1.0},
+        {"方法": "KMeans",        "轮廓系数": round(sil_km, 4),   "与GMM的ARI": round(ari_km, 4)},
+        {"方法": "层次聚类(Ward)", "轮廓系数": round(sil_ward, 4), "与GMM的ARI": round(ari_ward, 4)},
+    ]
+    table = pd.DataFrame(rows)
+    print(table.to_string(index=False))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    table.to_csv(out_dir / "table_algorithm_comparison_v5.csv", encoding="utf-8-sig", index=False)
+    print(f"  已保存 -> {out_dir / 'table_algorithm_comparison_v5.csv'}")
+    return table
+
+
+def feature_perturbation_ari(
+    X_base: np.ndarray,
+    baseline_labels: np.ndarray,
+    n_components: int,
+    n_trials: int = 100,
+    drop_ratio: float = 0.2,
+    out_dir: Path | None = None,
+) -> tuple[list[float], float]:
+    """
+    稳健性(3)：特征扰动稳定性（论文 5.3.5）。
+    随机剔除 drop_ratio（20%）的特征列（预处理展开后的特征空间），
+    每次用 GMM(K) 重新聚类，与基准标签计算 ARI，绘制直方图并报告均值。
+    """
+    print(f"\n--- 特征扰动 ARI 稳定性（随机剔除 {drop_ratio:.0%} 特征，{n_trials} 次） ---")
+    rng = np.random.default_rng(RANDOM_STATE)
+    n_feat = X_base.shape[1]
+    n_drop = max(1, int(round(n_feat * drop_ratio)))
+    print(f"  特征空间维度 {n_feat}，每次随机剔除 {n_drop} 列")
+
+    aris: list[float] = []
+    for i in range(1, n_trials + 1):
+        drop_idx = rng.choice(n_feat, size=n_drop, replace=False)
+        keep = np.ones(n_feat, dtype=bool)
+        keep[drop_idx] = False
+        X_pert = X_base[:, keep]
+        try:
+            gmm_p = GaussianMixture(
+                n_components=n_components, covariance_type=GMM_COVARIANCE_TYPE,
+                random_state=RANDOM_STATE, n_init=GMM_N_INIT, reg_covar=GMM_REG_COVAR,
+            )
+            gmm_p.fit(X_pert)
+            pred_all = gmm_p.predict(X_pert)
+        except Exception:
+            continue
+        aris.append(adjusted_rand_score(baseline_labels, pred_all))
+        if i % 25 == 0:
+            print(f"  ... {i}/{n_trials} 完成（当前 ARI 均值 {np.mean(aris):.3f}）")
+
+    if not aris:
+        print("  [警告] 特征扰动全部拟合失败")
+        return [], float("nan")
+
+    mean_ari = float(np.mean(aris))
+    lo, hi = np.percentile(aris, 2.5), np.percentile(aris, 97.5)
+    print(f"  ARI 均值 = {mean_ari:.3f}，95% 区间 = [{lo:.3f}, {hi:.3f}]，成功 {len(aris)}/{n_trials} 次")
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"perturbation_ari": aris}).to_csv(
+            out_dir / "robust_perturbation_ari_100_v5.csv", encoding="utf-8-sig")
+        _plot_ari_histogram(aris, f"特征扰动（剔除{drop_ratio:.0%}）ARI 分布（K={n_components}）",
+                            out_dir / "fig_perturbation_ari_100_v5.png")
+        print(f"  已保存 -> {out_dir / 'robust_perturbation_ari_100_v5.csv'}")
+    return aris, mean_ari
+
+
+def bootstrap_ari_stability(
+    X_base: np.ndarray,
+    baseline_labels: np.ndarray,
+    n_components: int,
+    n_boot: int = 500,
+    out_dir: Path | None = None,
+) -> tuple[list[float], float]:
+    """
+    稳健性(4)：增强 Bootstrap 稳定性（论文 5.3.5）。
+    500 次有放回重采样，每次在采样子集上训练 GMM(K)，
+    随后对全量数据预测标签并与基准标签计算 ARI，绘制直方图。
+    """
+    print(f"\n--- Bootstrap 重采样 ARI 稳定性（{n_boot} 次，预测全量数据） ---")
+    rng = np.random.default_rng(RANDOM_STATE)
+    n = len(X_base)
+    aris: list[float] = []
+    for i in range(1, n_boot + 1):
+        idx = rng.integers(0, n, size=n)
+        try:
+            gmm_b = GaussianMixture(
+                n_components=n_components, covariance_type=GMM_COVARIANCE_TYPE,
+                random_state=RANDOM_STATE, n_init=GMM_N_INIT, reg_covar=GMM_REG_COVAR,
+            )
+            gmm_b.fit(X_base[idx])
+            pred_all = gmm_b.predict(X_base)
+        except Exception:
+            continue
+        aris.append(adjusted_rand_score(baseline_labels, pred_all))
+        if i % 100 == 0:
+            print(f"  ... {i}/{n_boot} 完成（当前 ARI 均值 {np.mean(aris):.3f}）")
+
+    if not aris:
+        print("  [警告] Bootstrap 全部拟合失败")
+        return [], float("nan")
+
+    mean_ari = float(np.mean(aris))
+    lo, hi = np.percentile(aris, 2.5), np.percentile(aris, 97.5)
+    print(f"  ARI 均值 = {mean_ari:.3f}，95% 区间 = [{lo:.3f}, {hi:.3f}]，成功 {len(aris)}/{n_boot} 次")
+
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({"bootstrap_ari": aris}).to_csv(
+            out_dir / "robust_bootstrap_ari_500_v5.csv", encoding="utf-8-sig")
+        _plot_ari_histogram(aris, f"500 次 Bootstrap 的 ARI 分布（K={n_components}）",
+                            out_dir / "fig_bootstrap_ari_500_v5.png")
+        print(f"  已保存 -> {out_dir / 'robust_bootstrap_ari_500_v5.csv'}")
+    return aris, mean_ari
+
+
+def run_robustness_checks(df: pd.DataFrame, X: pd.DataFrame, y: pd.DataFrame,
+                          label_names: list[str], preprocessor, gmm, out_dir: Path):
+    """
+    论文 §5.3.5 四组稳健性检验（与论文声明一一对应）：
+      1. K 敏感性：K∈{3,4,5} 各跑一次 5 折 CV，对比化疗 AUC
+      2. 聚类算法对比：GMM vs KMeans vs Ward（K=最优K）轮廓系数 + ARI（表 A.8）
+      3. 特征扰动：随机剔除 20% 特征 × 100 次 → ARI 直方图（图 A.2）
+      4. Bootstrap：500 次有放回重采样 → 预测全量数据 → ARI 直方图（图 A.1）
     """
     print("\n" + "=" * 60)
-    print("[稳健性] P1 检验")
+    print("[稳健性] 论文 5.3.5 检验")
     print("=" * 60)
+    k_opt = gmm.n_components
 
-    # ---- K 敏感性 ----
+    # ---- (1) K 敏感性 ----
     print("\n--- K 敏感性（K=3,4,5 的 5 折 CV 对比） ---")
     results = []
     for k in [3, 4, 5]:
@@ -986,52 +1164,23 @@ def run_robustness_checks(df: pd.DataFrame, X: pd.DataFrame, y: pd.DataFrame, la
     out_dir.mkdir(parents=True, exist_ok=True)
     sens_table.to_csv(out_dir / "robust_k_sensitivity_v5.csv", encoding="utf-8-sig")
 
-    # ---- Bootstrap 重采样 ----
-    print("\n--- Bootstrap 重采样稳定性（簇占比 95% 区间） ---")
-    feature_cols = [c for c in df.columns if c.startswith("X_")]
-    X_raw = df[feature_cols].copy()
-    for col in WEIGHT_COLS:
-        if col in X_raw.columns:
-            X_raw[col] = X_raw[col] * WEIGHT_MULTIPLIER
-    pre = build_preprocessor(
-        filter_existing_columns(CATEGORICAL_COLS, X_raw),
-        filter_existing_columns(NUMERICAL_COLS, X_raw),
-        filter_existing_columns(COMORBIDITY_COLS, X_raw) + filter_existing_columns(OTHER_BINARY_COLS, X_raw),
-    )
-    X_base = pre.fit_transform(X_raw)
+    # ---- 基准标签（全特征 GMM 硬标签，K = 最优 K） ----
+    X_base = get_X_base(preprocessor, df)
+    baseline_labels = gmm.predict(X_base)
+    print(f"\n  基准 GMM (K={k_opt})：{len(X_base)} 例，特征维度 {X_base.shape[1]}")
 
-    rng = np.random.default_rng(RANDOM_STATE)
-    n_boot = 200
-    n = len(X_base)
-    fracs = []
-    for _ in range(n_boot):
-        idx = rng.integers(0, n, size=n)
-        gmm = GaussianMixture(n_components=n_components, covariance_type=GMM_COVARIANCE_TYPE,
-                              random_state=RANDOM_STATE, n_init=GMM_N_INIT, reg_covar=GMM_REG_COVAR)
-        try:
-            gmm.fit(X_base[idx])
-            lab = gmm.predict(X_base[idx])
-        except Exception:
-            continue
-        counts = np.bincount(lab, minlength=n_components)
-        fracs.append(counts / n)
+    # ---- (2) 聚类算法对比 ----
+    compare_clustering_algorithms(X_base, baseline_labels, k_opt, out_dir)
 
-    if fracs:
-        fracs = np.array(fracs)
-        boot_rows = []
-        for c in range(n_components):
-            col = fracs[:, c]
-            boot_rows.append({
-                "簇": c,
-                "占比均值": round(col.mean(), 4),
-                "占比95%下限": round(np.percentile(col, 2.5), 4),
-                "占比95%上限": round(np.percentile(col, 97.5), 4),
-            })
-        boot_table = pd.DataFrame(boot_rows)
-        print(boot_table.to_string())
-        boot_table.to_csv(out_dir / "robust_bootstrap_v5.csv", encoding="utf-8-sig")
-    else:
-        print("  [警告] Bootstrap 全部拟合失败")
+    # ---- (3) 特征扰动（20% × 100 次） ----
+    feature_perturbation_ari(X_base, baseline_labels, k_opt, n_trials=100,
+                             drop_ratio=0.2, out_dir=out_dir)
+
+    # ---- (4) Bootstrap（500 次） ----
+    bootstrap_ari_stability(X_base, baseline_labels, k_opt, n_boot=500, out_dir=out_dir)
+
+    print("\n[稳健性] 完成。论文对应：表 A.8（算法对比）、图 A.1（Bootstrap 500 次 ARI）、"
+          "图 A.2（特征扰动 20%×100 次 ARI）")
 
 
 # ======================== 验证入口 ========================
@@ -1078,7 +1227,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--k-min", type=int, default=K_MIN, help="BIC 候选聚类数下界（默认 2）")
     parser.add_argument("--k-max", type=int, default=K_MAX, help="BIC 候选聚类数上界（默认 10）")
     parser.add_argument("--figs-dir", type=str, default=str(RESULTS_DIR), help="图表/统计表输出目录")
-    parser.add_argument("--robust", action="store_true", help="开启 P1 稳健性检验（K 敏感性 + Bootstrap）")
+    parser.add_argument("--robust", action="store_true",
+                        help="开启稳健性检验（论文 5.3.5）：K 敏感性 + 算法对比 ARI + 特征扰动 20%×100 ARI + Bootstrap 500 ARI")
     parser.add_argument("--smoke", action="store_true", help="等同 --data smoke（用合成数据冒烟）")
     return parser.parse_args()
 
@@ -1114,9 +1264,9 @@ def main() -> None:
         # ---- 4. 全量训练最终模型（复用检索系统的 preprocessor + GMM） ----
         train_final_classifier_gmm(X_cls, y_cls, label_names, preprocessor, gmm)
 
-        # ---- 5. 稳健性检验（可选） ----
+        # ---- 5. 稳健性检验（可选，论文 5.3.5） ----
         if args.robust:
-            run_robustness_checks(df, X_cls, y_cls, label_names, best_k, figs_dir)
+            run_robustness_checks(df, X_cls, y_cls, label_names, preprocessor, gmm, figs_dir)
 
     if args.mode in ("validate", "all"):
         run_validation(figs_dir)
