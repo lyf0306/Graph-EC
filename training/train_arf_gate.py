@@ -42,8 +42,8 @@ class MoEDataset(Dataset):
             "neg_semantic": torch.tensor(item["neg_semantic_score"], dtype=torch.float32),
             "pos_graph": torch.tensor(item["pos_graph_score"], dtype=torch.float32),
             "neg_graph": torch.tensor(item["neg_graph_score"], dtype=torch.float32),
-            "is_complex": torch.tensor(1.0 if item["is_complex"] else 1.0, dtype=torch.float32) 
-            # 注意：返回权重倍数。如果是 complex，权重为 COMPLEX_WEIGHT，否则为 1.0
+            "is_complex": torch.tensor(1.0 if item["is_complex"] else 0.0, dtype=torch.float32)
+            # 注意：返回 complex flag（1.0=复杂，0.0=普通）；collate_fn 中转换为权重倍数（COMPLEX_WEIGHT / 1.0）
         }
 
 class MoERouter(nn.Module):

@@ -382,7 +382,9 @@ async def _handle_single_entity_extraction(
         "CONTEXT": "CONTEXT",
         "BACKGROUND": "CONTEXT",
         "EVIDENCE": "EVIDENCE",
-        "SOURCE": "EVIDENCE"
+        "SOURCE": "EVIDENCE",
+        "CONTRAINDICATION": "CONTRAINDICATION",
+        "CONTRANDICATION": "CONTRAINDICATION"
     }
     
     edge_role = ROLE_MAPPING.get(raw_role, "CONDITION")
